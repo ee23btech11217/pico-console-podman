@@ -1,0 +1,27 @@
+#,Subsystem,Signal / function,Pico GPIO,Pico physical pin,Peripheral pin / component,Notes,Source
+1,Display (SPI0),LED (backlight),16,21,LED,Driven directly from the GPIO (code drives it as an output).,board_pins.h
+2,Display (SPI0),DC (data/command),17,22,DC / RS,,board_pins.h
+3,Display (SPI0),SCK,18,24,SCK,Shared with SD card SCK.,board_pins.h
+4,Display (SPI0),MOSI,19,25,SDI (MOSI),Shared with SD card MOSI.,board_pins.h
+5,Display (SPI0),RESET,20,26,RESET / RST,,board_pins.h
+6,Display (SPI0),CS,21,27,CS,Separate from SD CS.,board_pins.h
+7,Display (SPI0),MISO (SDO),-,-,SDO,Not connected: display readback is not used.,board_pins.h (no pin defined)
+8,Display (SPI0),"Touch pins (T_CLK, T_CS, T_DIN, T_DO, T_IRQ)",-,-,T_* pins,Not connected: touch is not used.,Not in code
+9,SD card (SPI0),CS,5,7,SD_CS,Separate CS from the display.,board_pins.h
+10,SD card (SPI0),MISO,4,6,SD_MISO (SDO),Required for SD readback.,board_pins.h
+11,SD card (SPI0),MOSI,19,25,SD_MOSI (SDI),Same wire/net as display MOSI (GP19).,board_pins.h
+12,SD card (SPI0),SCK,18,24,SD_SCK,Same wire/net as display SCK (GP18).,board_pins.h
+13,Joystick,VRx (left/right),26,31,VRx,ADC0.,board_pins.h
+14,Joystick,VRy (up/down),27,32,VRy,ADC1.,board_pins.h
+16,Buttons,Button X,8,11,One leg of button,"Other leg to GND. Internal pull-up, pressed = low.",board_pins.h
+17,Buttons,Button Y,9,12,One leg of button,"Other leg to GND. Internal pull-up, pressed = low.",board_pins.h
+20,Speaker,PWM drive,15,20,1 kohm resistor to transistor base,Never drive the speaker straight from the pin (~400 mA).,"board_pins.h, README"
+21,Speaker,Base pulldown,-,"Any GND (3, 8, 13, 18, 23, 28, 33, 38)",10 kohm from transistor base to GND,,README
+22,Speaker,Transistor emitter,-,"Any GND (3, 8, 13, 18, 23, 28, 33, 38)",GND,S8050 / 2N2222 / BC337 (NPN). Check the pinout of your exact part.,README
+23,Speaker,Transistor collector,-,-,Speaker (-),,README
+24,Speaker,Speaker (+),-,40,VBUS (5 V) through 47 ohm,Alternative: 3V3 through 22 ohm.,README
+25,Speaker,Flyback diode 1N4148,-,-,Across speaker,Cathode on the speaker (+) side.,README
+26,Power,Display VCC,-,36,3V3(OUT),Module VCC on 3.3 V.,Not in code; typical module wiring
+27,Power,Display GND,-,"Any GND (3, 8, 13, 18, 23, 28, 33, 38)",GND,,Not in code; typical module wiring
+28,Power,Joystick VCC (marked +5V on KY-023),-,36,3V3(OUT),"Power from 3V3, never 5 V (ADC pins are 3.3 V only).",README
+29,Power,Joystick GND,-,"Any GND (3, 8, 13, 18, 23, 28, 33, 38)",GND,,Not in code; typical module wiring

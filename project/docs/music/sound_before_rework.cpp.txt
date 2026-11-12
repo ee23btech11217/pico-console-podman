@@ -1,0 +1,411 @@
+#include "audio/sound.h"
+
+#include "board_pins.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/pwm.h"
+#include "pico/time.h"
+
+#include <cstddef>
+
+#ifndef AUDIO_PIN
+#define AUDIO_PIN 15
+#endif
+
+#ifndef SOUND_VOLUME
+#define SOUND_VOLUME 70
+#endif
+
+#ifndef MUSIC_VOLUME
+#define MUSIC_VOLUME 40
+#endif
+
+namespace {
+
+constexpr uint32_t PWM_TOP = 4999;
+constexpr uint32_t MIN_HZ = 200;
+constexpr uint32_t MAX_HZ = 12000;
+constexpr uint32_t TICK_US = 1000;
+
+uint g_slice;
+uint g_chan;
+uint32_t g_divK;
+
+constexpr uint8_t F_NOISE = 1;
+
+struct Seg {
+    uint16_t f0, f1, ms;
+    uint8_t vol, flags;
+};
+struct Effect {
+    const Seg *segs;
+    uint8_t count;
+    uint8_t prio;
+};
+
+#define SEGS(name, ...) const Seg name[] = {__VA_ARGS__}
+
+SEGS(s_vulcan, {1800, 900, 40, 50, 0});
+SEGS(s_laser, {3200, 700, 90, 55, 0});
+SEGS(s_missile, {900, 300, 150, 55, F_NOISE});
+SEGS(s_hit_enemy, {1500, 800, 25, 50, F_NOISE});
+SEGS(s_hit_player, {800, 400, 100, 70, F_NOISE});
+SEGS(s_kill_small, {2200, 600, 90, 60, F_NOISE});
+SEGS(s_kill_big, {1800, 400, 220, 70, F_NOISE}, {600, 250, 120, 60, 0});
+SEGS(s_player_killed, {1200, 250, 350, 70, 0}, {700, 300, 350, 70, F_NOISE});
+SEGS(s_fragment, {1500, 2200, 25, 45, 0});
+SEGS(s_upgrade, {880, 880, 60, 60, 0}, {1175, 1175, 60, 60, 0}, {1568, 1568, 60, 60, 0},
+     {2093, 2093, 110, 60, 0});
+SEGS(s_menu_select, {1500, 1500, 25, 45, 0});
+SEGS(s_menu_start, {1000, 1000, 50, 55, 0}, {1500, 1500, 90, 55, 0});
+SEGS(s_launch, {400, 3000, 600, 55, 0});
+SEGS(s_arrive, {3000, 400, 500, 55, 0});
+SEGS(s_alarm, {2000, 2000, 80, 70, 0}, {0, 0, 40, 0, 0}, {2000, 2000, 80, 70, 0});
+SEGS(s_dodge, {500, 1500, 70, 45, 0});
+
+#define EFFECT(segs, prio) {segs, (uint8_t)(sizeof(segs) / sizeof(segs[0])), prio}
+
+const Effect EFFECTS[SND_COUNT] = {
+    EFFECT(s_vulcan, 1),
+    EFFECT(s_laser, 1),
+    EFFECT(s_missile, 2),
+    EFFECT(s_hit_enemy, 2),
+    EFFECT(s_hit_player, 4),
+    EFFECT(s_kill_small, 3),
+    EFFECT(s_kill_big, 4),
+    EFFECT(s_player_killed, 7),
+    EFFECT(s_fragment, 2),
+    EFFECT(s_upgrade, 5),
+    EFFECT(s_menu_select, 3),
+    EFFECT(s_menu_start, 3),
+    EFFECT(s_launch, 5),
+    EFFECT(s_arrive, 5),
+    EFFECT(s_alarm, 6),
+    EFFECT(s_dodge, 1),
+};
+
+enum Note : uint8_t {
+    A3 = 57, B3 = 59, C4 = 60, D4 = 62, E4 = 64, F4 = 65, G4 = 67, Gs4 = 68, A4 = 69, B4 = 71,
+    C5 = 72, D5 = 74, E5 = 76, F5 = 77, G5 = 79, Gs5 = 80, A5 = 81, B5 = 83, C6 = 84, D6 = 86,
+};
+constexpr uint8_t NOTE_MIN = A3;
+constexpr uint8_t NOTE_MAX = D6;
+
+const uint16_t NOTE_HZ[] = {220,  233,  247,  262,  277,  294,  311,  330,  349,  370,
+                            392,  415,  440,  466,  494,  523,  554,  587,  622,  659,
+                            698,  740,  784,  831,  880,  932,  988,  1047, 1109, 1175};
+static_assert(sizeof(NOTE_HZ) / sizeof(NOTE_HZ[0]) == NOTE_MAX - NOTE_MIN + 1, "NOTE_HZ size");
+
+constexpr uint32_t GAP_MS = 12;
+constexpr uint32_t LOOP_STEPS = 256;
+constexpr uint32_t ARP_STEPS = 128;
+constexpr uint32_t BAR_STEPS = 16;
+constexpr uint32_t TIER_COUNT = 4;
+
+const uint8_t VOICE[6][4] = {
+    {A3, C4, E4, A4},
+    {A3, C4, F4, A4},
+    {C4, E4, G4, C5},
+    {B3, D4, G4, B4},
+    {A3, D4, F4, A4},
+    {B3, E4, Gs4, B4},
+};
+
+struct MNote {
+    uint8_t note;
+    uint8_t len;
+};
+
+const uint8_t PROG0[8] = {0, 1, 2, 3, 0, 1, 2, 3};
+const uint8_t ARP0[16] = {0, 2, 1, 2, 0, 2, 1, 3, 0, 2, 1, 2, 0, 3, 2, 1};
+constexpr MNote MEL0[] = {
+    {E5, 4}, {C5, 2}, {D5, 2}, {E5, 4}, {A4, 4},
+    {C5, 4}, {A4, 2}, {C5, 2}, {F5, 4}, {E5, 4},
+    {G4, 2}, {C5, 2}, {E5, 4}, {G5, 4}, {E5, 2}, {D5, 2},
+    {D5, 4}, {B4, 4}, {D5, 4}, {G4, 4},
+    {E5, 4}, {C5, 2}, {D5, 2}, {E5, 4}, {A5, 4},
+    {C5, 2}, {F5, 2}, {A5, 4}, {F5, 4}, {C5, 4},
+    {D5, 4}, {F5, 4}, {A5, 4}, {F5, 2}, {D5, 2},
+    {E5, 4}, {D5, 2}, {B4, 2}, {Gs4, 4}, {E5, 4},
+};
+
+const uint8_t PROG1[8] = {0, 1, 2, 3, 0, 1, 4, 5};
+const uint8_t ARP1[16] = {0, 3, 1, 3, 2, 3, 1, 3, 0, 3, 1, 3, 2, 3, 3, 1};
+constexpr MNote MEL1[] = {
+    {E5, 2}, {E5, 2}, {C5, 2}, {D5, 2}, {E5, 2}, {G5, 2}, {E5, 2}, {A4, 2},
+    {C5, 2}, {C5, 2}, {A4, 2}, {C5, 2}, {F5, 2}, {F5, 2}, {E5, 2}, {C5, 2},
+    {G4, 2}, {C5, 2}, {E5, 2}, {G5, 2}, {G5, 2}, {E5, 2}, {D5, 2}, {C5, 2},
+    {D5, 2}, {D5, 2}, {B4, 2}, {D5, 2}, {G5, 2}, {D5, 2}, {B4, 2}, {G4, 2},
+    {E5, 2}, {E5, 2}, {C5, 2}, {E5, 2}, {A5, 4}, {G5, 2}, {E5, 2},
+    {F5, 2}, {F5, 2}, {A5, 2}, {F5, 2}, {C6, 4}, {A5, 2}, {F5, 2},
+    {D5, 2}, {F5, 2}, {A5, 2}, {F5, 2}, {D5, 2}, {F5, 2}, {A5, 4},
+    {E5, 2}, {Gs5, 2}, {B5, 4}, {Gs5, 2}, {E5, 2}, {D5, 2}, {B4, 2},
+};
+
+const uint8_t PROG2[8] = {0, 3, 1, 5, 0, 3, 1, 5};
+const uint8_t ARP2[16] = {0, 3, 2, 3, 0, 3, 2, 3, 0, 3, 2, 3, 1, 3, 2, 3};
+constexpr MNote MEL2[] = {
+    {A4, 3}, {C5, 3}, {E5, 2}, {A5, 4}, {G5, 2}, {E5, 2},
+    {G4, 3}, {B4, 3}, {D5, 2}, {G5, 4}, {E5, 2}, {D5, 2},
+    {F5, 3}, {E5, 3}, {C5, 2}, {A4, 4}, {C5, 2}, {F5, 2},
+    {E5, 3}, {Gs5, 3}, {B5, 2}, {Gs5, 4}, {E5, 2}, {B4, 2},
+    {A5, 3}, {G5, 3}, {E5, 2}, {C5, 4}, {E5, 2}, {A4, 2},
+    {G5, 3}, {D5, 3}, {B4, 2}, {D5, 4}, {G5, 2}, {B5, 2},
+    {A5, 3}, {F5, 3}, {C5, 2}, {F5, 4}, {A5, 2}, {C6, 2},
+    {B5, 2}, {Gs5, 2}, {E5, 2}, {D5, 2}, {B4, 2}, {Gs4, 2}, {E4, 4},
+};
+
+const uint8_t PROG3[8] = {0, 3, 1, 5, 0, 3, 1, 5};
+const uint8_t ARP3[16] = {0, 3, 1, 3, 0, 3, 2, 3, 0, 3, 1, 3, 0, 3, 2, 3};
+constexpr MNote MEL3[] = {
+    {A5, 2}, {E5, 2}, {A5, 2}, {E5, 2}, {C6, 2}, {A5, 2}, {E5, 2}, {C5, 2},
+    {G5, 2}, {D5, 2}, {G5, 2}, {D5, 2}, {B5, 2}, {G5, 2}, {D5, 2}, {B4, 2},
+    {F5, 2}, {C5, 2}, {F5, 2}, {C5, 2}, {A5, 2}, {F5, 2}, {C5, 2}, {A4, 2},
+    {E5, 2}, {B4, 2}, {E5, 2}, {Gs5, 2}, {B5, 2}, {Gs5, 2}, {E5, 2}, {B4, 2},
+    {C6, 2}, {A5, 2}, {E5, 2}, {A5, 2}, {C6, 2}, {D6, 2}, {C6, 2}, {A5, 2},
+    {D6, 2}, {B5, 2}, {G5, 2}, {B5, 2}, {D6, 2}, {B5, 2}, {G5, 2}, {D5, 2},
+    {C6, 2}, {A5, 2}, {F5, 2}, {A5, 2}, {C6, 2}, {A5, 2}, {F5, 2}, {C5, 2},
+    {B5, 2}, {Gs5, 2}, {E5, 2}, {D5, 2}, {B4, 2}, {Gs4, 2}, {E4, 4},
+};
+
+struct BarIdx {
+    uint8_t idx[8];
+    bool ok;
+};
+template <size_t N>
+constexpr BarIdx bar_index(const MNote (&m)[N]) {
+    BarIdx r{};
+    r.ok = true;
+    uint32_t acc = 0, bar = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (acc % BAR_STEPS == 0) {
+            if (bar >= 8) {
+                r.ok = false;
+                break;
+            }
+            r.idx[bar++] = (uint8_t)i;
+        }
+        if (acc % BAR_STEPS + m[i].len > BAR_STEPS) r.ok = false;
+        acc += m[i].len;
+    }
+    if (acc != LOOP_STEPS - ARP_STEPS || bar != 8) r.ok = false;
+    return r;
+}
+
+struct Tier {
+    uint8_t stepMs;
+    uint8_t offAccent;
+    uint8_t volPct;
+    const uint8_t *prog;
+    const uint8_t *arp;
+    const MNote *melody;
+    BarIdx bars;
+};
+
+constexpr BarIdx BARS0 = bar_index(MEL0);
+constexpr BarIdx BARS1 = bar_index(MEL1);
+constexpr BarIdx BARS2 = bar_index(MEL2);
+constexpr BarIdx BARS3 = bar_index(MEL3);
+static_assert(BARS0.ok, "MEL0 must fill 8 whole bars");
+static_assert(BARS1.ok, "MEL1 must fill 8 whole bars");
+static_assert(BARS2.ok, "MEL2 must fill 8 whole bars");
+static_assert(BARS3.ok, "MEL3 must fill 8 whole bars");
+
+constexpr Tier TIERS[TIER_COUNT] = {
+    {110, 70, 85, PROG0, ARP0, MEL0, BARS0},
+    {95, 75, 95, PROG1, ARP1, MEL1, BARS1},
+    {82, 80, 105, PROG2, ARP2, MEL2, BARS2},
+    {70, 85, 115, PROG3, ARP3, MEL3, BARS3},
+};
+
+uint32_t g_mpos = 0;
+uint32_t g_mi = 0;
+uint32_t g_mdur = 0;
+uint32_t g_mt = 0;
+uint8_t g_mnote = A3;
+uint8_t g_maccent = 100;
+uint8_t g_tier = 0;
+
+volatile bool g_musicOn = false;
+volatile uint8_t g_wantTier = 0;
+
+void music_reset() {
+    g_mpos = 0;
+    g_mi = 0;
+    g_mdur = 0;
+    g_mt = 0;
+}
+
+inline bool music_tick(uint32_t &hz, uint32_t &vol) {
+    if (g_mt >= g_mdur) {
+        if (g_mpos % BAR_STEPS == 0) {
+
+            uint32_t w = g_wantTier;
+            if (w >= TIER_COUNT) w = TIER_COUNT - 1;
+            g_tier = (uint8_t)w;
+            if (g_mpos >= ARP_STEPS) g_mi = TIERS[g_tier].bars.idx[(g_mpos - ARP_STEPS) / BAR_STEPS];
+        }
+        const Tier &T = TIERS[g_tier];
+        uint32_t len;
+        if (g_mpos < ARP_STEPS) {
+            const uint32_t s = g_mpos & 15;
+            g_mnote = VOICE[T.prog[(g_mpos >> 4) & 7]][T.arp[s]];
+            g_maccent = ((s & 3) == 0) ? 100 : T.offAccent;
+            len = 1;
+        } else {
+            g_mnote = T.melody[g_mi].note;
+            len = T.melody[g_mi].len;
+            ++g_mi;
+            g_maccent = 90;
+        }
+        g_mdur = len * T.stepMs;
+        g_mt = 0;
+        g_mpos += len;
+        if (g_mpos >= LOOP_STEPS) g_mpos = 0;
+    }
+    const uint32_t t = g_mt++;
+    if (t + GAP_MS >= g_mdur) return false;
+    hz = NOTE_HZ[g_mnote - NOTE_MIN];
+    const uint32_t env = 100 - 35 * t / g_mdur;
+    uint32_t v = (uint32_t)MUSIC_VOLUME * g_maccent / 100 * env / 100 * TIERS[g_tier].volPct / 100;
+    vol = v > 100 ? 100 : v;
+    return true;
+}
+
+constexpr uint32_t RING = 32;
+uint32_t g_ring[RING];
+uint32_t g_head = 0;
+uint32_t g_tail = 0;
+
+int g_cur = -1;
+uint8_t g_seg = 0;
+uint32_t g_t = 0;
+uint32_t g_rng = 0x2545F491u;
+
+bool g_quiet = true;
+
+inline void silence() {
+    pwm_set_chan_level(g_slice, g_chan, 0);
+    g_quiet = true;
+}
+
+inline void tone(uint32_t hz, uint32_t vol) {
+    if (hz < MIN_HZ) hz = MIN_HZ;
+    if (hz > MAX_HZ) hz = MAX_HZ;
+    uint32_t div = g_divK / hz;
+    if (div < 16) div = 16;
+    if (div > 4095) div = 4095;
+    pwm_hw->slice[g_slice].div = div;
+
+    const uint32_t level = (PWM_TOP + 1) * vol * (uint32_t)SOUND_VOLUME / 20000u;
+    pwm_set_chan_level(g_slice, g_chan, (uint16_t)level);
+    g_quiet = false;
+}
+
+inline uint32_t rnd() {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+
+bool __not_in_flash_func(sound_tick)(repeating_timer_t *) {
+
+    uint32_t t = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
+    const uint32_t h = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
+    uint32_t pending = 0;
+    while (t != h) {
+        pending |= g_ring[t & (RING - 1)];
+        ++t;
+    }
+    __atomic_store_n(&g_tail, t, __ATOMIC_RELEASE);
+
+    if (pending) {
+        int best = -1;
+        for (int i = 0; i < SND_COUNT; ++i) {
+            if ((pending >> i) & 1u) {
+                if (best < 0 || EFFECTS[i].prio > EFFECTS[best].prio) best = i;
+            }
+        }
+        if (best >= 0 && (g_cur < 0 || EFFECTS[best].prio >= EFFECTS[g_cur].prio)) {
+            g_cur = best;
+            g_seg = 0;
+            g_t = 0;
+        }
+    }
+
+    uint32_t mhz = 0, mvol = 0;
+    bool music_sounds = false;
+    if (g_musicOn) {
+        music_sounds = music_tick(mhz, mvol);
+    } else if (g_mpos != 0 || g_mdur != 0) {
+        music_reset();
+    }
+
+    if (g_cur >= 0) {
+        const Effect &e = EFFECTS[g_cur];
+        while (g_t >= e.segs[g_seg].ms) {
+            ++g_seg;
+            g_t = 0;
+            if (g_seg >= e.count) {
+                g_cur = -1;
+                break;
+            }
+        }
+        if (g_cur >= 0) {
+            const Seg &s = e.segs[g_seg];
+            if (s.f0 == 0) {
+                silence();
+            } else {
+                int32_t f = (int32_t)s.f0 +
+                            ((int32_t)s.f1 - (int32_t)s.f0) * (int32_t)g_t / (int32_t)s.ms;
+                if (f < 1) f = 1;
+                if (s.flags & F_NOISE) {
+                    f = f / 2 + (int32_t)(rnd() % (uint32_t)f);
+                }
+                tone((uint32_t)f, s.vol);
+            }
+            ++g_t;
+            return true;
+        }
+    }
+
+    if (music_sounds && mvol > 0) {
+        tone(mhz, mvol);
+    } else if (!g_quiet) {
+        silence();
+    }
+    return true;
+}
+
+repeating_timer_t g_timer;
+
+}
+
+void sound_init() {
+    g_slice = pwm_gpio_to_slice_num(AUDIO_PIN);
+    g_chan = pwm_gpio_to_channel(AUDIO_PIN);
+    g_divK = (uint32_t)(((uint64_t)clock_get_hz(clk_sys) * 16u) / (PWM_TOP + 1));
+
+    gpio_set_function(AUDIO_PIN, GPIO_FUNC_PWM);
+    pwm_config cfg = pwm_get_default_config();
+    pwm_config_set_wrap(&cfg, PWM_TOP);
+    pwm_init(g_slice, &cfg, true);
+    silence();
+
+    add_repeating_timer_us(-(int32_t)TICK_US, sound_tick, nullptr, &g_timer);
+}
+
+void sound_request(uint32_t bits) {
+    bits &= (1u << SND_COUNT) - 1u;
+    if (bits == 0) return;
+    const uint32_t h = __atomic_load_n(&g_head, __ATOMIC_RELAXED);
+    const uint32_t t = __atomic_load_n(&g_tail, __ATOMIC_ACQUIRE);
+    if (h - t >= RING) return;
+    g_ring[h & (RING - 1)] = bits;
+    __atomic_store_n(&g_head, h + 1, __ATOMIC_RELEASE);
+}
+
+void sound_music(bool on) { g_musicOn = on; }
+
+void sound_music_level(uint8_t level) { g_wantTier = level < TIER_COUNT ? level : (uint8_t)(TIER_COUNT - 1); }

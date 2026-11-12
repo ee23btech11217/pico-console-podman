@@ -1,0 +1,933 @@
+#ifndef DEVOURSPHERE_RENDER_RENDERER_HPP
+#define DEVOURSPHERE_RENDER_RENDERER_HPP
+
+// Draws the game state with ShapoGFX. Platform independent: the platform
+// layer supplies the target surface (a whole frame buffer or a band of it).
+//
+// Frame structure:
+//   beginFrame()  computes the camera and builds the whole 3D scene: stars
+//                 (points), the sphere wireframe (lines),
+//                 entities, floating fragments and bullets (triangles),
+//                 debris and dash dust (lines)
+//   renderBand()  draws the rows [y, y + h) of the frame into a surface:
+//                 black background, the 3D scene, then the 2D overlays
+//                 (enemy gauges, horizon markers) and the HUD
+//   endFrame()
+//
+// Everything but the HUD goes through the scanline 3D renderer, so a device
+// without a frame buffer can render band by band.
+//
+// The 3D renderer works in float, in "fragment units" (FU) relative to the
+// player's position, so precision stays high anywhere on the sphere.
+
+#include <cstddef>
+#include <cstdint>
+
+#include "devoursphere/profile.hpp"
+#include "devoursphere/sim/game.hpp"
+#include "shapoco/gfx2d/gfx2d.hpp"
+#include "shapoco/gfx3d/gfx3d.hpp"
+
+namespace devoursphere::render {
+
+namespace g2 = shapoco::gfx2d;
+namespace g3 = shapoco::gfx3d;
+
+// Health gauge drawn over an enemy
+struct Gauge2D {
+  int16_t x, y, w;
+  uint8_t ratio;  // 0..255
+};
+
+// Marker on the horizon for an enemy beyond it
+// Build-time switch: with DEVOURSPHERE_SUPPRESS_ALPHA=1 nothing is blended
+// on the frame outside the 3D pipeline: the off-screen enemy auras become
+// solid triangles, the health warning shrinks, and the horizon markers and
+// the dash dust are drawn opaque instead of additively, and the HUD text's
+// drop shadow is solid black (the PicoSystem: every blended pixel reads the
+// frame back, a millisecond a fan there)
+#ifndef DEVOURSPHERE_SUPPRESS_ALPHA
+#define DEVOURSPHERE_SUPPRESS_ALPHA 0
+#endif
+
+// Build-time switch: with DEVOURSPHERE_NO_DEPTH=1 the world layer carries
+// no depth either (LayerFlags::NO_DEPTH, like the overlay layer always
+// has): its records lose the depth plane (12 bytes each) and the span
+// resolution its depth compare, and what is drawn later covers what was
+// drawn earlier. buildScene() then orders the world itself, back to front
+// as far as it can: the floating fragments first, the bodies farthest
+// first, the bullets and the effects on top. The scene is mostly looked
+// down on from above, where bodies rarely overlap, so what is wrong (a
+// fragment behind a body drawn over it, a bullet under a body) is rare and
+// small. For a target short of arena and time.
+#ifndef DEVOURSPHERE_NO_DEPTH
+#define DEVOURSPHERE_NO_DEPTH 0
+#endif
+
+// Build-time switch: with DEVOURSPHERE_CAMERA_ROLL=0 the camera no longer
+// rolls into a turn. The body still banks (sim::Entity::bank, which is the
+// simulation's and identical either way); only the view stops leaning. For
+// a platform steered by tilting the device itself, where the screen already
+// rolls in the player's hand and the camera doing it too is one roll
+// too many.
+#ifndef DEVOURSPHERE_CAMERA_ROLL
+#define DEVOURSPHERE_CAMERA_ROLL 1
+#endif
+
+// Horizon markers: shown up to this angle around the sphere from the camera
+// (75 degrees, about 670 FU along the surface), fading to this brightness
+constexpr float MARKER_MAX_ANGLE = 75.0f * 3.14159265358979f / 180.0f;
+constexpr float MARKER_MIN_BRIGHTNESS = 0.25f;
+
+struct Marker2D {
+  int16_t x, y;
+  // Which way is down: the screen direction from the marker towards the
+  // centre of the sphere, in brad (a quarter turn = straight down the
+  // screen). The triangle's tip points along it, so a marker at the side
+  // of the screen leans with the horizon instead of standing upright.
+  uint16_t down;
+  g2::Color color;
+  uint8_t kind;     // 0 = enemy (triangle), else sim::UpgradeKind icon
+  uint8_t outline;  // enemy: 0 = dark edge, else white edge brightness
+};
+
+// Icon of an upgrade kind, centered at (cx, cy), 14 px tall at scale8 = 8:
+// its outline as a polygon (star-shaped around the center, up to 8 points;
+// returns the point count, 0 for an unknown kind) and a filled drawing
+int upgradeIconPolygon(int kind, int cx, int cy, g2::vec2i *pts,
+                       int scale8 = 8);
+void drawUpgradeIcon(g2::Graphics2D &g, int kind, int cx, int cy, g2::Color c,
+                     int scale8 = 8);
+
+// Text in the current font of g, magnified by an integer. gfx2d enlarges text
+// only through its transform, which the boards with small screens build out
+// (SHAPOGFX2D_TRANSFORM=0); at scale 1 these leave the transform alone, and
+// only scale 1 may be used there. Sizes are in target pixels.
+int textWidth(const g2::Graphics2D &g, const char *text, int scale = 1);
+int textLineAdvance(const g2::Graphics2D &g, int scale = 1);  // baselines
+int textLineHeight(const g2::Graphics2D &g, int scale = 1);   // line box
+// The line box's top-left corner at (x, y)
+void drawText(g2::Graphics2D &g, int x, int y, const char *text,
+              int scale = 1);
+
+// The screen size the HUD layout is written against; every distance below is
+// that layout's pixel value scaled by UiMetrics::scale8
+constexpr int UI_REF_W = 480, UI_REF_H = 320;
+
+// The screen height the entity detail thresholds are written against (the
+// handhelds). A body's radius on screen is proportional to the focal length,
+// which is proportional to the height (the vertical field of view is fixed),
+// so a shorter screen makes every entity fewer pixels across and the
+// thresholds bite earlier -- on 240x135 an enemy right in front of the
+// player came out as the far-away outline. Renderer::lodScale_ scales them
+// by the height below this, and not at all above it: a large screen keeps
+// the thresholds it was tuned with.
+constexpr int LOD_REF_H = 240;
+
+// How the HUD adapts to the frame buffer size (computed by init()). The
+// layout is expressed in the reference screen's pixels and multiplied by
+// `scale8` (in 1/8 units); text that still does not fit is shortened or
+// dropped. Full-width overlays are placed at fractions of the height
+// instead, so they follow the aspect ratio.
+struct UiMetrics {
+  int scale8 = 8;        // UI scale in 1/8 of the reference screen
+  int fontMult = 1;      // integer magnification of the fonts
+  bool compact = false;  // below 3/4 of the reference: smaller fonts
+  bool tiny = false;     // below 1/2: minimal HUD
+  int margin = 8;        // distance from the screen edge
+  int gaugeW = 120;      // player health gauge
+  int gaugeH = 8;
+  int iconScale8 = 8;    // upgrade icons (they stop shrinking at 1/2)
+  int markerScale8 = 8;  // horizon markers
+  int wireLines = 1100;  // budget for the sphere wireframe
+};
+
+// The control hints on the title screen. Every platform has its own input
+// device, so the strings come from the front end; the defaults describe a PC
+// keyboard. Each line has a shorter alternative used when the screen is too
+// narrow for the first one (and is dropped when neither fits). The platform
+// owns the storage: pass string literals or something that outlives the
+// renderer.
+struct ControlHints {
+  const char *move = "MOVE: ARROWS / WASD   FIRE: SPACE / J L   DODGE: I K / C-M";
+  const char *moveAlt = "ARROWS: MOVE  SPACE: FIRE  I/K: DODGE";
+  const char *dash = "UP: DASH   DOWN: BRAKE";
+  const char *dashAlt = "UP / DOWN: DASH / BRAKE";
+  // The pause screen (what resumes, and DOWN for the mute)
+  const char *pause = "ESC / P: RESUME    DOWN: SOUND ON / OFF";
+  const char *pauseAlt = "ESC: RESUME   DOWN: SOUND";
+};
+
+// How much of the frame the platform covers with something it draws itself
+// (a virtual pad). The HUD keeps out of it. World-anchored drawing -- the 3D
+// scene, the enemy gauges, the horizon markers, the hit flash -- ignores
+// this: only the HUD moves. The UI scale still comes from the whole frame,
+// so the fonts do not shrink because a pad is in the way; a line that then
+// does not fit takes its usual shorter form or is dropped.
+//
+// `top` and `bottom` move every edge-anchored row inwards. `left` and
+// `right` describe a pad sitting in the BOTTOM corners (the layout the WASM
+// front end uses on a phone held sideways, and the M5Tab5 one), so they
+// apply to the bottom row alone -- the upgrade icons, the spare cores, the
+// version and the hint lines. The top row and the centered banners keep the
+// full width, because nothing covers the top corners.
+struct HudInsets {
+  int left = 0, right = 0, top = 0, bottom = 0;
+};
+
+// What the HUD needs from the simulation, taken once per frame by
+// beginFrame(). The HUD is drawn inside renderBand(), so without this a
+// platform that advances the simulation on another core while the bands are
+// rasterized would read the state as it changes underneath.
+struct HudState {
+  uint32_t tickCount = 0;
+  uint32_t score = 0, highScore = 0;
+  uint32_t events = 0;
+  int32_t playerHp = 0, playerHpMax = 1;
+  int stateTimer = 0;
+  int sphereLevel = 1, spheresCleared = 0;
+  int playerRank = 1, aliveEntities = 1;
+  int bountyCount = 0;  // enemies alive with a bounty (the ones to kill)
+  bool playerAlive = true;
+  int selectedWeapon = 0, playerWeapon = 0;
+  int cores = 0;
+  int upgradeLevel[sim::UPGRADE_KINDS] = {};
+  int dodgeReadyQ8 = 256;  // emergency dodge: 256 = ready
+  int timeLeftTicks = 0;   // of the sphere's time limit
+  bool timeUp = false;     // the wreck of a timed-out player is on screen
+  uint32_t sphereScore = 0, clearBonus = 0;  // the last clear (LAUNCH)
+  int clearTicks = 0;
+  int highScoreSphere = 0;  // the sphere reached in the high score run
+  sim::GameState state = sim::GameState::TITLE;
+  bool debugMode = false;
+  bool paused = false;
+  bool muted = false;
+};
+
+// Font roles of the HUD (the fonts themselves live in hud.cpp)
+enum class HudFont : uint8_t { SMALL, MEDIUM, LARGE, TITLE };
+
+// A piece of debris: a small spinning wireframe triangle that shrinks away
+struct Debris {
+  g3::vec3f pos, vel;  // FU relative to the render origin
+  g3::vec3f u, v;      // the triangle's plane: two perpendicular unit vectors
+  float angle, spin;   // radians, radians per second
+  float size, life, life0;  // FU, seconds
+  g2::Color color;
+};
+
+// Pickup flash: a big triangle facing the camera that spins and shrinks
+// onto the player
+struct Pickup {
+  float age;    // seconds
+  float angle;  // radians
+  float duration;
+  float scale;  // radius multiplier
+  g2::Color color;
+};
+
+// Dust streak of the dash effect (world static; streams towards the camera)
+struct Dust {
+  g3::vec3f pos;
+  float age;
+};
+
+// Colors of the upgrade kinds (index = sim::UpgradeKind)
+g2::Color upgradeColor(int kind);
+
+struct Camera {
+  g3::vec3f eye, target, up;  // FU, relative to the player's position
+  float fovY;                 // radians
+};
+
+struct RenderStats {
+  int lines, points, entitiesDrawn, kites;
+  g3::Stats gfx;
+};
+
+// Where beginFrame() spends its time (see devoursphere/profile.hpp). Slots:
+//   0 camera   1 effects (collect + update)
+//   2 stars and the sphere wireframe   3 entities (markers, sorting, bodies)
+//   4 floating fragments   5 bullets   6 effects (pickups, debris, dust)
+//   7 the screen-space overlays (auras, health warning, markers)
+//   8 ShapoGFX beginRender (the depth sort)
+// and where renderBand() spends its, summed over the bands of a frame:
+//   9 the 3D rasterizer   10 the 2D work (clear, gauges, HUD)
+enum FramePhase {
+  FP_CAMERA = 0,
+  FP_EFFECTS,
+  FP_SPHERE,
+  FP_ENTITIES,
+  FP_FRAGMENTS,
+  FP_BULLETS,
+  FP_EFFECTS_DRAW,
+  FP_OVERLAYS,
+  FP_SORT,
+  FP_BAND_3D,
+  FP_BAND_2D,
+  FP_COUNT
+};
+
+class Renderer {
+ public:
+  static constexpr int PALETTE_SIZE = 24;
+#ifndef DEVOURSPHERE_MAX_WIRE
+#define DEVOURSPHERE_MAX_WIRE 1100
+#endif
+  static constexpr int MAX_WIRE = DEVOURSPHERE_MAX_WIRE;  // wireframe segments
+// The 2D line and point arrays (see "2D lines" below): 14 and 8 bytes an
+// entry. A small target may cap them; what does not fit takes the 3D path.
+#ifndef DEVOURSPHERE_MAX_LINES2D
+#define DEVOURSPHERE_MAX_LINES2D 512
+#endif
+#ifndef DEVOURSPHERE_MAX_POINTS2D
+#define DEVOURSPHERE_MAX_POINTS2D 256
+#endif
+  static constexpr int MAX_LINES2D = DEVOURSPHERE_MAX_LINES2D;
+  static constexpr int MAX_POINTS2D = DEVOURSPHERE_MAX_POINTS2D;
+  static constexpr int MAX_SPHERE_LEVEL = 7;
+  // How many levels the mesh may grade over between the point below the
+  // camera and the horizon
+  static constexpr int SPHERE_LEVEL_STEPS = 5;
+// How big a face of the mesh wants to be on the screen, in pixels. The
+// line budget only ever makes them bigger than this (sphere.cpp), so this
+// is what the mesh costs on a board with time to spare -- and a board
+// without it can ask for bigger cells: the count goes as the square of it,
+// so 36 draws and walks less than half of what 24 does.
+#ifndef DEVOURSPHERE_SPHERE_TARGET_PX
+#define DEVOURSPHERE_SPHERE_TARGET_PX 24
+#endif
+  static constexpr float SPHERE_TARGET_PX_INIT = DEVOURSPHERE_SPHERE_TARGET_PX;
+// The per-frame arrays of the overlay and the effects (gauges 8 B, markers
+// 16 B, debris 72 B, dust 16 B, stars 24 B an entry). A small target may cap
+// them; what does not fit is not drawn, nothing else changes.
+#ifndef DEVOURSPHERE_MAX_GAUGES
+#define DEVOURSPHERE_MAX_GAUGES 64
+#endif
+#ifndef DEVOURSPHERE_MAX_MARKERS
+#define DEVOURSPHERE_MAX_MARKERS 40
+#endif
+#ifndef DEVOURSPHERE_MAX_ENEMY_MARKERS
+#define DEVOURSPHERE_MAX_ENEMY_MARKERS 32
+#endif
+#ifndef DEVOURSPHERE_MAX_DEBRIS
+#define DEVOURSPHERE_MAX_DEBRIS 64
+#endif
+#ifndef DEVOURSPHERE_MAX_DUST
+#define DEVOURSPHERE_MAX_DUST 64
+#endif
+#ifndef DEVOURSPHERE_MAX_STARS
+#define DEVOURSPHERE_MAX_STARS 120
+#endif
+  static constexpr int MAX_GAUGES = DEVOURSPHERE_MAX_GAUGES;
+  static constexpr int MAX_MARKERS = DEVOURSPHERE_MAX_MARKERS;
+  // the rest is kept for upgrades
+  static constexpr int MAX_ENEMY_MARKERS = DEVOURSPHERE_MAX_ENEMY_MARKERS;
+  static constexpr int MAX_DEBRIS = DEVOURSPHERE_MAX_DEBRIS;
+  static constexpr int MAX_DUST = DEVOURSPHERE_MAX_DUST;
+  static constexpr int MAX_STARS = DEVOURSPHERE_MAX_STARS;
+  static_assert(MAX_ENEMY_MARKERS <= MAX_MARKERS, "markers");
+
+  // arena: working memory of the 3D renderer. The triangle buffer it is
+  // divided into is what binds: about 37 KB on a 32-bit target holds the
+  // whole scene at 240x240 without the renderer thinning it, and the peak
+  // frame only uses half of that. 64 KB is comfortable there; the WASM front
+  // end keeps 256 KB because it has the room and draws bigger screens.
+  //
+  // spanCapacity: spans held per scanline, 0 for the ShapoGFX default (a
+  // quarter of what is left after the fixed part, which is far more than
+  // this scene needs -- see impl/xiamocon/SPEC.md). Whatever it saves goes
+  // to the triangle buffer.
+  void init(int width, int height, void *arena, size_t arenaSize,
+            int spanCapacity = 0);
+
+  // The control hints of the title screen (init() keeps them, so this can be
+  // called once at start up whatever the frame buffer size does afterwards)
+  void setControlHints(const ControlHints &hints) { hints_ = hints; }
+
+  // The HUD's safe area (see HudInsets). Like the control hints this is kept
+  // across init(), so a platform that changes the frame buffer size does not
+  // have to set it again -- but the values are in pixels of the frame, so a
+  // platform that does change the size has to.
+  void setHudInsets(const HudInsets &insets) { insets_ = insets; }
+  const HudInsets &hudInsets() const { return insets_; }
+
+  // Take the effects the simulation raised during the last tick. A platform
+  // that runs several ticks per frame must call this after every tick: the
+  // simulation only keeps the events of the current tick, so the ones it
+  // catches up on would be lost otherwise. beginFrame() does the same for the
+  // tick it is given, and both skip a tick that was already collected.
+  void pollEffects(const sim::Game &game);
+  // The HUD's snapshot of the simulation, as of the last beginFrame(). A
+  // platform whose other core ticks the game reads the state from here
+  const HudState &hud() const { return hud_; }
+
+  // dt: seconds since the previous frame (camera smoothing and effects)
+  void beginFrame(const sim::Game &game, float dt);
+  // Draw the rows [y, y + h) of the frame into dst starting at row dstY
+  void renderBand(const g2::Surface &dst, int y, int h, int dstY = 0);
+  void endFrame();
+
+  RenderStats stats() const;
+
+  // Cap on the triangles spent on full entity bodies per frame (0 = only
+  // what the triangle buffer allows). The bodies are the one part of the
+  // frame whose cost grows with the crowd: each is up to 18 triangles
+  // through the float vertex pipeline, ~60 us a kite on a Cortex-M0+. With
+  // a cap the nearest entities keep their bodies and the rest are drawn as
+  // outlines, and the frame time stops depending on how many are in view.
+  void setDetailTriangles(int tris) { detailTris_ = tris; }
+
+  // Forget everything carried from frame to frame (camera easing, effects
+  // and their random numbers, the score roll-up, the mesh steering), as
+  // init() does, so that a run started from the same game state draws the
+  // same frames. The benchmark calls it at the start of every scene.
+  void restart();
+
+  // A table in place of the frame (the benchmark's results): head items
+  // across the top of the first page (as many to a line as fit, two spaces
+  // apart, the footer last; the other pages have the footer alone), then
+  // rows of a label and `columns` values under column titles. The renderer picks the font
+  // (the monospace one, then the two small proportional ones, each at the
+  // HUD's magnification and below) and how many copies of the table fit
+  // side by side, for as few pages as possible, and the biggest font among
+  // the layouts that need that few. Nothing is copied.
+  struct TextTable {
+    const char *const *head = nullptr;  // items above the table
+    int headCount = 0;
+    const char *const *titles = nullptr;  // one per value column
+    int columns = 0;                      // value columns (at most 4)
+    const char *const *cells = nullptr;   // rows x (1 + columns), label first
+    int rows = 0;
+    // Read when drawn, so it may change after showTable(), but no wider
+    // than it was then (the layout made room for that width)
+    const char *footer = nullptr;
+  };
+  // Show page `page` of the table (nullptr goes back to the game). Returns
+  // how many pages the table takes on this frame.
+  int showTable(const TextTable *table, int page);
+  bool showingText() const { return table_ != nullptr; }
+  // Width of a line of the banner, in characters of the monospace font
+  static constexpr int TEXT_COLS = 21;
+  // One line over the game (the benchmark's progress), or nullptr
+  void setBanner(const char *text) { banner_ = text; }
+  const PhaseTimer &frameProfile() const { return frameProfile_; }
+  void resetFrameProfile() { frameProfile_.reset(); }
+  const UiMetrics &uiMetrics() const { return ui_; }
+  const Camera &camera() const { return cam_; }
+
+  // --- Pico 2 fork (see third_party/devoursphere_core/PATCHES.md) -----------
+  // The backdrop camera in float, for a platform that paints the world's
+  // surface itself: the eye relative to the sphere centre in 1/16 world units,
+  // the view basis (unit vectors), the focal length and the screen centre in
+  // pixels. Valid after beginFrame().
+  struct BackdropView {
+    int32_t eye[3];
+    float right[3], up[3], fwd[3];
+    float focal, cx, cy;
+    int32_t sphereRadius16;  // 1/16 world units
+  };
+  const BackdropView &backdropView() const { return backdropView_; }
+  // Called by renderBand() right after the band is cleared, before the stars,
+  // the wireframe and everything else, so what it paints is the bottom layer.
+  // dst/y/h/dstY are renderBand()'s arguments.
+  using BandHook = void (*)(const BackdropView &view, const g2::Surface &dst, int y, int h, int dstY);
+  void setBandHook(BandHook hook) { bandHook_ = hook; }
+  // How opaque the sphere's wireframe lines are, 0..256 (256 = the original solid lines). Below that
+  // they are blended over whatever is already in the band, so a painted surface shows through.
+  // Skin of an entity's body: called for every vertex of every fragment kite of a body that is drawn in
+  // full (not for the core, the far-away outline or a hit flash). (lx, ly) is the vertex's position on
+  // the body in world units (x to the right, y forward), bodyRadius the body's radius in the same
+  // units, base the entity's flat colour. Return true and set `out` to give that vertex a colour; the
+  // kite is then drawn with per-vertex colours instead of the flat one.
+  using SkinHook = bool (*)(bool isPlayer, g2::Color base, int32_t lx, int32_t ly, int32_t bodyRadius, g2::Color &out);
+  void setSkinHook(SkinHook hook) { skinHook_ = hook; }
+  // fork 10: body lighting. Called once per frame from buildScene(); return true and set `toSun` (unit vector
+  // towards the sun, world axes) to light the visible bodies: colour x (ambient + sun x max(0, n . toSun)),
+  // n = the kite's plane normal turned towards the eye. Fragments, bullets, effects and overlays stay unlit.
+  using BodyLightHook = bool (*)(float toSun[3]);
+  void setBodyLightHook(BodyLightHook hook, float ambient, float sun) {
+    bodyLightHook_ = hook;
+    bodyAmbient_ = ambient;
+    bodySun_ = sun;
+  }
+  // A whole-screen takeover: called for every band right after it is cleared. When it returns true the band
+  // has been painted by the platform (menus, cut scenes) and renderBand() returns without drawing the scene.
+  using ScreenHook = bool (*)(const g2::Surface &dst, int y, int h, int dstY);
+  void setScreenHook(ScreenHook hook) { screenHook_ = hook; }
+  // The best score of each weapon (and the sphere reached), shown under the weapons on the weapon select
+  // screen. The platform keeps them (flash); the Game's own single high score is not used for this.
+  void setWeaponHighScores(const uint32_t score[3], const int sphere[3]) {
+    for (int i = 0; i < 3; i++) {
+      weaponHigh_[i] = score[i];
+      weaponHighSphere_[i] = sphere[i];
+    }
+  }
+  void setWireAlpha(int a) { wireAlpha_ = a < 0 ? 0 : (a > 256 ? 256 : a); }
+  int width() const { return w_; }
+  int height() const { return h_; }
+
+ private:
+  int w_ = 0, h_ = 0;
+  UiMetrics ui_;
+  ControlHints hints_;  // set by the platform, kept across init()
+  HudInsets insets_;    // same
+  HudState hud_;        // snapshot for renderBand(), taken in beginFrame()
+  // Where the HUD may draw (HudInsets). The vertical pair bounds every
+  // edge-anchored row; the horizontal pair is the bottom row's span between
+  // the pads. With no insets both are just the frame.
+  int hudY0() const { return insets_.top; }
+  int hudY1() const { return h_ - insets_.bottom; }
+  int hudH() const { return hudY1() - hudY0(); }
+  int barX0() const { return insets_.left; }
+  int barX1() const { return w_ - insets_.right; }
+  int barW() const { return barX1() - barX0(); }
+  // A distance of the reference layout in the pixels of this screen
+  int ui(int refPx) const { return refPx * ui_.scale8 / 8; }
+  // A vertical position of the reference layout as a fraction of the height
+  // (full-width overlays follow the aspect ratio instead of the UI scale)
+  int uiY(int refY) const { return refY * h_ / UI_REF_H; }
+  int ui(int refPx, int minPx) const {
+    int v = ui(refPx);
+    return v < minPx ? minPx : v;
+  }
+  // The entity detail thresholds of this screen (see LOD_REF_H): a radius in
+  // the reference screen's pixels, in the pixels this one projects it to
+  float lod(float refPx) const { return refPx * lodScale_; }
+  float lodScale_ = 1.0f;  // h_ / LOD_REF_H, never above 1
+  g3::Graphics3D g3d_;
+  const sim::Game *game_ = nullptr;
+  const TextTable *table_ = nullptr;
+  int tablePage_ = 0;
+  // The layout showTable() chose
+  struct TableLayout {
+    const void *font = nullptr;  // a g2::GFXfont
+    int scale = 1, lineH = 0, gap = 0, panelGap = 0;
+    int labelW = 0, colW[4] = {}, tableW = 0;
+    int panels = 1, pages = 1;
+    // Rows of a panel on the first page (under the head) and on the others
+    // (under the footer alone)
+    int rowsFirst = 1, rowsRest = 1;
+    bool fits = true;  // no wider than the frame
+    int headLines = 0, footLines = 0;
+  } tl_;
+  // Lay the head items (only the footer when !items) out in lines of the
+  // frame's width; calls line(x, y, item) for each (y counts lines),
+  // returns the lines
+  template <typename F>
+  int packHead(const TextTable &t, bool items, g2::Graphics2D &g, int scale,
+               F &&line) const;
+  TableLayout layoutTable(const TextTable &t, const void *font,
+                          int scale) const;
+  const char *banner_ = nullptr;
+  void drawTextScreen(g2::Graphics2D &g, int oy) const;
+  void drawBanner(g2::Graphics2D &g, int oy) const;
+  float time_ = 0;
+  uint32_t rng_ = 0x1234567u;
+
+  // Camera
+  Camera cam_ = {};
+  bool camValid_ = false;
+  // The rig is eased in "framing" units -- what the distance would be at
+  // the reference lens (CAM_FOV_REF) -- and scaled to the real distance by
+  // the lens it is actually using, so that a change of lens never moves
+  // the body on screen (see updateCamera)
+  float camFrame_ = 0, camFrameH_ = 0;  // eased: distance and height
+  float camLens_ = 0;    // the lens the body's size asks for (radians)
+  float camFovMul_ = 1;  // what the dash and the brake do to it
+  float camDist_ = 0, camHeight_ = 0, camFov_ = 0, camRoll_ = 0;  // derived
+  float camAhead_ = 0, camDown_ = 0;  // look target: ahead / below the player
+  // The flight between spheres: the camera circles the player (0 = behind,
+  // PI = in front) and the player's frame is pitched along its flight path
+  // (positive = nose up) for both the body and the camera
+  float camOrbit_ = 0, camPitch_ = 0;
+  g3::vec3f flightFwd_ = {0, 1, 0}, flightUp_ = {0, 0, 1};  // pitched frame
+  uint16_t playerPitchBrad_ = 0;
+  uint32_t sphereSeedSeen_ = 0;  // a new sphere snaps the camera distance
+  float camNominal_ = 11;  // framing distance without dash/brake (sphere LOD)
+  g3::mat4f view_ = g3::mat4f::identity();
+  g3::mat4f proj_ = g3::mat4f::identity();
+  g3::mat4f viewProj_ = g3::mat4f::identity();
+  float focalPx_ = 1;
+  g3::vec3f viewDir_ = {0, 0, -1};
+  sim::Vec3 origin_ = {};  // world units of the render origin
+  bool originValid_ = false;
+  g3::vec3f sphereCenter_ = {};  // FU relative to the origin
+  g3::vec3f camUnit_ = {};       // unit vector sphere center -> eye
+  float cosHorizon_ = 0;
+  float horizonAngle_ = 0;
+  float cullCos_[MAX_SPHERE_LEVEL + 1] = {};
+  // How big a face of the mesh should come out on the screen, in pixels:
+  // the one thing the level of detail is steered by. The line count it
+  // leads to is measured and this is nudged towards the budget (see
+  // buildSphere); everything else about the mesh follows from the camera.
+  // What the mesh is measured from: the camera as it cruises, without the
+  // dash and the brake. Following those would rebuild the mesh every time
+  // the camera dives, and they are the one part of it the player can move
+  // several times a second.
+  float camAltitude_ = 11;    // the eye over the surface, FU
+  float camFocalNominal_ = 1; // px per unit at unit distance
+  float sphereTarget_ = SPHERE_TARGET_PX_INIT;
+  // The finest level in the mesh, kept between frames with a dead zone so
+  // that a camera sitting between two levels does not flip the picture
+  int sphereTop_ = 0;
+  int wireBudget_ = 1100;  // lines the mesh may use this frame (the flight
+                           // gets the whole array, the surface its share)
+  bool sphereDryRun_ = false;  // count edges instead of emitting them
+  int sphereCount_ = 0;        // edges the last pass walked
+  int wireDrawn_ = 0;          // ... and how many of them it kept
+  bool sphereCountValid_ = false;
+  // The player off the surface (LAUNCH / ARRIVE): the sphere is seen from
+  // afar, so the mesh keeps a floor of FLIGHT_MIN_LEVEL, the fine regions
+  // around the player shrink to nothing, the fade starts at the altitude,
+  // and the line budget is the whole array
+  bool inFlight_ = false;
+  float altExcess_ = 0;         // FU above the cruising altitude (>= 0)
+  int32_t wireFadeOffset_ = 0;  // 1/16 units subtracted from the fade distance
+
+  // Per-frame bookkeeping
+  // How deeply the mesh is subdivided along each of a face's three edges
+  // ([0] = v0-v1, [1] = v1-v2, [2] = v2-v0), four bits each so that the
+  // whole thing rides back from subdivideFace() in a register. A leaf
+  // reports zero on all three.
+  using EdgeDepths = uint16_t;
+  static constexpr int edgeDepth(EdgeDepths e, int i) {
+    return (e >> (i * 4)) & 0xF;
+  }
+  static constexpr EdgeDepths makeEdgeDepths(int e0, int e1, int e2) {
+    return (EdgeDepths)((e0 & 0xF) | ((e1 & 0xF) << 4) | ((e2 & 0xF) << 8));
+  }
+  // Subdivision depth of each icosahedron edge (255: the two vertices are
+  // not an edge of it), taken from the deeper of the two faces that share
+  // it, and what each of the 20 faces reported
+  uint8_t icoEdgeDepth_[12][12];
+  EdgeDepths faceDepth_[20];
+  int lineCount_ = 0, pointCount_ = 0, entitiesDrawn_ = 0, kites_ = 0;
+  // The integer camera the backdrop is projected with (sphere.cpp):
+  // derived from the float one at the end of updateCamera(). Vectors are
+  // Q30; the eye is in 1/16 world units relative to the sphere center; the
+  // focal length and the screen center are in 1/16 pixel.
+  struct CameraQ {
+    sim::Vec3 right, up, fwd;  // view basis
+    sim::Vec3 unit;            // sphere center -> eye (camUnit_)
+    sim::Vec3 player;          // sphere center -> player (presence auras)
+    sim::Vec3 eye;
+    int32_t focal16, cx16, cy16;
+    int32_t cosHorizon;
+    int32_t cullCos[MAX_SPHERE_LEVEL + 1];
+    // The four sides of the screen as planes through the eye: a face whose
+    // whole extent is outside one of them is off screen (sphereConstants)
+    sim::Vec3 cullN[4];
+    int32_t cullPlane[4][MAX_SPHERE_LEVEL + 1];
+    // The mesh (sphereConstants): the coarsest level drawn, and for a face
+    // of each level the cosines at which it wants one more level than that
+    int levelMin;
+    int32_t cosStep[MAX_SPHERE_LEVEL + 1][SPHERE_LEVEL_STEPS];
+  };
+  CameraQ camQ_ = {};
+  BackdropView backdropView_ = {};
+  BandHook bandHook_ = nullptr;
+  int wireAlpha_ = 256;
+  SkinHook skinHook_ = nullptr;
+  BodyLightHook bodyLightHook_ = nullptr;  // fork 10
+  float bodyAmbient_ = 0.6f, bodySun_ = 0.6f;
+  bool litNormals_ = false;  // fork 10: the put*Q functions compute real normals (lights on)
+  void kiteNormalQ(const sim::Vec3 &c, const sim::Vec3 &dir, const sim::Vec3 &perp, int16_t n[3]) const;
+  uint32_t weaponHigh_[3] = {0, 0, 0};
+  int weaponHighSphere_[3] = {0, 0, 0};
+  ScreenHook screenHook_ = nullptr;
+  bool projectQ(const sim::Vec3 &pos, int32_t &sx, int32_t &sy) const;
+  // The stars' directions (Q30) and colors, fixed at init()
+  sim::Vec3 starDir_[MAX_STARS];
+  g2::Color starColor_[MAX_STARS];
+  bool starsValid_ = false;
+  // Visible entities of the frame, sorted by distance. A member rather than
+  // a local: 256 of these is 3 KB, which is most of the 4 KB stack a core
+  // gets on RP2350 (the stacks live in SCRATCH_X / SCRATCH_Y and cannot be
+  // grown), and buildScene() would overflow it.
+  struct Vis {
+    int32_t d;  // eye distance, units
+    float px;   // body radius on screen, pixels
+    int16_t idx;
+    bool full;  // drawn with every fragment (the triangle budget's choice)
+  };
+  Vis vis_[sim::MAX_ENTITIES];
+
+  // The backdrop -- the stars and the sphere wireframe -- is not put through
+  // the 3D pipeline. Both layers carry no depth and everything in the world
+  // is in front of them, so beginFrame() projects them to screen segments
+  // and points, and renderBand() draws those straight into the band before
+  // the 3D layers. What it saves is a vertex transform, a primitive setup
+  // and a record for every line, and a span per scanline the line crosses:
+  // on a Cortex-M0+ that was 240 us per line in beginFrame() and most of
+  // the rasterization time.
+  struct WireSeg {
+    int16_t x0, y0, x1, y1;  // screen, 1/16 pixel, clipped to the screen
+    uint8_t b0, b1;          // brightness at each end (wireBrightness())
+  };
+  // The largest UiMetrics::wireLines is 1100; a small target may cap the
+  // array (10 bytes a segment) with DEVOURSPHERE_MAX_WIRE, and computeUi()
+  // keeps the budget within it
+  WireSeg wire_[MAX_WIRE];
+  int wireCount_ = 0;
+  struct StarPt {
+    int16_t x, y;
+    g2::Color c;
+  };
+  StarPt stars_[MAX_STARS];
+  int starCount_ = 0;
+  // Native pixels of the wireframe ramp, 32 steps of brightness, built for
+  // the format of the band being drawn
+  uint16_t wireNative_[32] = {};
+  g2::PixelFormat wireNativeFormat_ = g2::PixelFormat::GRAY1;
+  bool wireNativeValid_ = false;
+  void addWireSegment(const sim::Vec3 &ua, const sim::Vec3 &ub, int level);
+  void drawBackdropBand(const g2::Surface &dst, int y, int h, int dstY);
+
+  // 2D lines and points. On a core without an FPU a line or a point costs
+  // about 50 us through ShapoGFX's vertex stage whatever it draws, and a
+  // crowded frame has a hundred of each (the outlines of far entities,
+  // debris, dash dust, far fragments). Like the wireframe they are
+  // projected once here and drawn per band by the integer DDA, either
+  // under the 3D layers (hidden by any body in front: the outlines, the
+  // points) or over them (the effects, the marker outlines). There is no
+  // depth test: a piece of debris behind a body shows through it.
+  // L2D_ADD may be or-ed in: the line is added onto the frame (the dash
+  // dust) instead of overwriting it
+  enum Layer2D : uint8_t { L2D_UNDER = 0, L2D_OVER = 1, L2D_ADD = 2 };
+  struct LineSeg {
+    int16_t x0, y0, x1, y1;  // screen, 1/16 pixel, clipped to the screen
+    uint8_t b0, b1;          // brightness at each end, 0..255 (255 = color)
+    uint8_t layer;           // Layer2D (bit 0), L2D_ADD (bit 1)
+    uint16_t rgb565;         // the color (14 bytes an entry; RAM is short)
+  };
+  static uint16_t packRgb565(g2::Color c) {
+    return (uint16_t)(((g2::colorR(c) >> 3) << 11) |
+                      ((g2::colorG(c) >> 2) << 5) | (g2::colorB(c) >> 3));
+  }
+  static g2::Color unpackRgb565(uint16_t v) {
+    const int r = (v >> 11) & 31, g = (v >> 5) & 63, b = v & 31;
+    return g2::makeColor((r << 3) | (r >> 2), (g << 2) | (g >> 4),
+                         (b << 3) | (b >> 2));
+  }
+  LineSeg lines_[MAX_LINES2D];
+  int lineCount2D_ = 0;
+  StarPt points_[MAX_POINTS2D];
+  int pointCount2D_ = 0;
+  // Clip a segment (1/16 px) to the screen, interpolating the brightness;
+  // false when nothing is left
+  bool clipSegment16(int32_t &x0, int32_t &y0, int32_t &x1, int32_t &y1,
+                     int &b0, int &b1) const;
+  // A point in world units relative to origin_ -> screen (1/16 px)
+  bool projectUnitsQ(const sim::Vec3 &p, int32_t &sx, int32_t &sy) const;
+  // Each adder returns false only when the array is full (the caller then
+  // takes the 3D path); a line behind the near plane is dropped and true
+  void addLineScreen(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                     g2::Color c, int b0, int b1, Layer2D layer);
+  bool addLine2D(const sim::Vec3 &a, const sim::Vec3 &b, g2::Color c, int b0,
+                 int b1, Layer2D layer);
+  bool addLine2Df(const g3::vec3f &a, const g3::vec3f &b, g2::Color c, int b0,
+                  int b1, Layer2D layer);
+  bool addPoint2D(const sim::Vec3 &p, g2::Color c);
+  // A closed loop of float points (effects), 2D when there is room
+  void putLoop2Df(const g3::vec3f *pts, int n, g2::Color c, Layer2D layer,
+                  const g3::Material &fallback);
+  void drawLines2D(const g2::Surface &dst, int y, int h, int dstY,
+                   Layer2D layer);
+  void drawMarkers2D(g2::Graphics2D &g, int oy);
+  // The three corners of an enemy marker's triangle, leaning with the
+  // horizon; `grow` pushes every edge that many pixels outwards
+  static void markerTriangle(const Marker2D &mk, int scale8, int grow,
+                             g2::vec2i out[3]);
+  void drawVersion(g2::Graphics2D &g, int oy);
+  void upgradeStatusExtents(int &leftEnd, int &rightStart) const;
+  void queueMarkerOutlines();
+  void drawWireSegment(const g2::Surface &dst, const WireSeg &s, int y, int h,
+                       int dstY);
+
+  Gauge2D gauges_[MAX_GAUGES];
+  int gaugeCount_ = 0;
+  Marker2D markers_[MAX_MARKERS];
+  int markerCount_ = 0;
+
+  // Effects (float, render side only)
+  Debris debris_[MAX_DEBRIS];
+  int debrisCount_ = 0;
+  Dust dust_[MAX_DUST];
+  int dustCount_ = 0;
+  static constexpr int MAX_PICKUPS = 4;
+  Pickup pickups_[MAX_PICKUPS];
+  int pickupCount_ = 0;
+  uint32_t lastPickupTick_ = 0xFFFFFFFFu;
+  float dustSpawnAcc_ = 0;
+  uint32_t lastEffectTick_ = 0xFFFFFFFFu;
+  float flash_[sim::MAX_ENTITIES] = {};  // seconds left of the white flash
+  // Score as shown on the HUD: it rolls up towards the real score (a fixed
+  // fraction of the remaining gap per second, so it keeps pace with the
+  // faster gains on later spheres) and snaps down when the score drops
+  double scoreShown_ = 0;
+  PhaseTimer frameProfile_;
+  int detailTris_ = 0;
+  static constexpr float SCORE_ROLL_PER_SEC = 4.0f;    // fraction of the gap
+  static constexpr float SCORE_ROLL_MIN_PER_SEC = 30;  // points
+  void updateScoreDisplay(float dt);
+  uint32_t scoreShown() const { return (uint32_t)scoreShown_; }
+
+  // Materials
+  enum Palette : int {
+    PAL_PLAYER = 0,     // teal, like the floating fragments
+    PAL_ENEMY_BIG,      // bigger than the player: pink
+    PAL_ENEMY_SMALL,    // not bigger than the player: light blue
+    PAL_ENEMY_BOUNTY,   // carries a bounty (Entity::bounty): orange-yellow
+    PAL_FRAGMENT,       // floating fragments (teal)
+    PAL_CORE,           // white
+    PAL_BULLET_PLAYER,  // additive orange
+    PAL_BULLET_ENEMY,   // additive pink-red
+    PAL_LASER_PLAYER,
+    PAL_LINE,      // vertex colored lines and points (wireframe, stars, debris)
+    PAL_LINE_ADD,  // vertex colored additive lines (dash dust)
+    PAL_FRAGMENT_WHITE,  // floating fragments the player cannot eat (heal only)
+    PAL_FLASH_RED,       // the player's hit flash
+    PAL_UP_SHIELD,       // floating upgrades (additive solids)
+    PAL_UP_OVERDRIVE,
+    PAL_UP_THRUSTER,
+    PAL_UP_CORE,
+  };
+  g3::Material palette_[PALETTE_SIZE];
+
+  // renderer.cpp
+  float frand();  // 0..1
+  void updateCamera(float dt);
+  g3::vec3f toLocal(const sim::Vec3 &worldUnits) const;
+  bool project(const g3::vec3f &p, float &sx, float &sy) const;
+  void putLine3(const g3::vec3f &a, const g3::vec3f &b, g2::Color ca,
+                g2::Color cb, const g3::Material &m);
+  void putLineLoop3(const g3::vec3f *pts, int n, g2::Color c,
+                    const g3::Material &m);
+  void putPoint3(const g3::vec3f &p, g2::Color c, const g3::Material &m);
+  void putKite(const g3::vec3f &c, const g3::vec3f &dir, const g3::vec3f &perp,
+               float s, float tipLen, const g3::Material &m);
+  void putQuad(const g3::vec3f &c, const g3::vec3f &dir, const g3::vec3f &perp,
+               float halfLen, float halfWidth, const g3::Material &m);
+  void buildScene();
+  // Integer geometry: positions in world units relative to origin_,
+  // directions as the simulation's Q30 unit vectors; ShapoGFX takes the
+  // vertices as FixedVertex (16.16 FU = units << 8). No float anywhere.
+  // fork: like putKiteQ, with a colour per vertex (tip, +perp, tail, -perp)
+  void putKiteQColors(const sim::Vec3 &c, const sim::Vec3 &dir, const sim::Vec3 &perp, int32_t s,
+                      int32_t tipLen, const g2::Color col[4]);
+  void putKiteQ(const sim::Vec3 &c, const sim::Vec3 &dir, const sim::Vec3 &perp,
+                int32_t s, int32_t tipLen, const g3::Material &m);
+  void putQuadQ(const sim::Vec3 &c, const sim::Vec3 &dir, const sim::Vec3 &perp,
+                int32_t halfLen, int32_t halfWidth, const g3::Material &m);
+  void putLineLoopQ(const sim::Vec3 *pts, int n, g2::Color c,
+                    const g3::Material &m, Layer2D layer);
+  void putPointQ(const sim::Vec3 &p, g2::Color c, const g3::Material &m);
+  sim::Vec3 eyeQ_ = {};  // cam_.eye in world units relative to origin_
+  void drawEntity(const sim::Entity &c, const sim::Vec3 &pos, float px,
+                  bool full, bool blink);
+  void drawVisible(const sim::Game &g, const Vis &v);
+  void drawFloatingFragments();
+  void drawBullets();
+  void drawStars();
+  void drawPresenceAuras();
+  // Which way the centre of the sphere is from a point on the screen, in
+  // brad (Marker2D::down). Every line through the centre of the sphere
+  // meets the same point on the screen, so it is projected once a frame
+  // (markerFocus_) and every marker only has to take a direction to it.
+  uint16_t markerDown(float sx, float sy) const;
+  g3::vec3f markerFocus_ = {};  // x, y on the screen; z: in front (+1 / -1)
+  // Horizon marker of an enemy beyond the horizon; `always`: shown whatever
+  // its size and distance (carriers of upgrades)
+  void addEnemyMarker(const sim::Entity &c, bool always);
+  void drawHealthWarning();
+  // Screen-space drawing inside the 3D scene: a plane facing the camera at
+  // a given view-space depth, and the world position of a screen pixel on it
+  struct ScreenPlane {
+    g3::vec3f right, up;
+    float tanX, tanY;
+  };
+  ScreenPlane screenPlane() const;
+  g3::vec3f screenToWorld(const ScreenPlane &sp, float sx, float sy,
+                          float depth) const;
+  // upgrades.cpp
+  void drawFloatingUpgrades(bool withMarkers);
+  void putSolid(const g3::vec3f *verts, int nv, const uint16_t *idx, int ni,
+                const g3::Material &m);
+  const g3::Material &materialForEntity(const sim::Entity &c) const;
+  g2::Color colorForEntity(const sim::Entity &c) const;
+
+  // sphere.cpp
+  void buildSphere();
+  int countSphereLines(const int *order);
+  // Subdivide one face and draw the lines separating its children; returns
+  // how deeply the mesh ended up subdivided along the face's own edges. See
+  // sphere.cpp for why that is all a face draws.
+  EdgeDepths subdivideFace(const sim::Vec3 &a, const sim::Vec3 &b,
+                           const sim::Vec3 &c, int level);
+  void sphereConstants();
+  int wantLevel(const sim::Vec3 &center, int level) const;
+  // Draw a-b as 2^depth chords lying on the sphere
+  void emitEdge(const sim::Vec3 &a, const sim::Vec3 &b, int depth, int level);
+  void emitSplitEdge(const sim::Vec3 &a, const sim::Vec3 &b, int depth,
+                     int level);
+  void emitChord(const sim::Vec3 &a, const sim::Vec3 &b, int level);
+  void traverseSphere(const int *order);
+  void emitIcoEdges();
+
+  // effects.cpp
+  void shiftEffects(const g3::vec3f &delta);
+  void spawnDebris(const g3::vec3f &pos, int count, float size,
+                   g2::Color color);
+  void collectEffects();
+  void updateEffects(float dt);
+  void drawEffects();
+
+  // hud.cpp
+  void drawHud(g2::Graphics2D &g, int offsetY);
+  // Whether the band g is clipped to (frame rows [clip.y - oy, ...)) lies
+  // between the HUD's top strip and its bottom strip with nothing of the
+  // HUD in between: while playing, that is every band but the first and
+  // the last. drawHud() then draws nothing, which is what it would have
+  // drawn, only without formatting and measuring every string first --
+  // which, done once per band, was near half of a band's 2D time on a
+  // 128 px screen.
+  bool hudBandIdle(g2::Graphics2D &g, int oy) const;
+  void drawUpgradeStatus(g2::Graphics2D &g, int offsetY);
+  // Sets the font and the magnification the members below draw text with
+  void setHudFont(g2::Graphics2D &g, HudFont role) const;
+  void setHudFont(g2::Graphics2D &g, const g2::GFXfont *font, int scale) const;
+  // The text functions above at that magnification. Only the drawing
+  // (band) side may call these: textScale_ is its state.
+  mutable int textScale_ = 1;
+  int textW(const g2::Graphics2D &g, const char *text) const {
+    return textWidth(g, text, textScale_);
+  }
+  int lineAdv(const g2::Graphics2D &g) const {
+    return textLineAdvance(g, textScale_);
+  }
+  int lineBox(const g2::Graphics2D &g) const {
+    return textLineHeight(g, textScale_);
+  }
+  void putText(g2::Graphics2D &g, int x, int y, const char *text) const {
+    drawText(g, x, y, text, textScale_);
+  }
+  void drawCenteredText(g2::Graphics2D &g, int y, const char *text,
+                        g2::Color color);
+  // Centered text that is replaced by `alt` when it does not fit, and
+  // dropped when `alt` does not fit either (or is null). Returns what was
+  // drawn, 0 for nothing.
+  const char *drawCenteredFit(g2::Graphics2D &g, int y, const char *text,
+                              const char *alt, g2::Color color);
+  // The same, for a line along the bottom edge: centered in the bottom
+  // row's span (barX0()..barX1()) so it stays clear of a virtual pad in
+  // the corners
+  const char *drawBottomFit(g2::Graphics2D &g, int y, const char *text,
+                            const char *alt, g2::Color color);
+  int textFits(g2::Graphics2D &g, const char *text) const;
+  int textFitsIn(g2::Graphics2D &g, const char *text, int width) const;
+};
+
+}  // namespace devoursphere::render
+
+#endif

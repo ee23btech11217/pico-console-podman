@@ -1,0 +1,7 @@
+# Install on the podman HOST (not in the container):
+#   sudo cp 99-pico.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Any RP2040/RP2350 mode (BOOTSEL 2e8a:0003/000f, app CDC+reset 2e8a:000a ...)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", MODE="0666"
+# USB CDC serial (/dev/ttyACM*) from the Pico's printf output
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", MODE="0666"

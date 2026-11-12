@@ -1,0 +1,14 @@
+# secrets / credentials
+.claude-token
+*.token
+.env
+.claude/
+# logs, backups, build output, archives
+*.log
+backups/
+project.zip
+*.bak
+project/out/
+project/pico-game-src.tar.gz
+# vendor datasheet (copyrighted)
+project/RP-008373-DS-3-rp2350-datasheet.pdf
